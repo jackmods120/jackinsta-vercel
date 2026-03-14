@@ -1,110 +1,115 @@
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import requests
 import json
 import re
 
 
-# ── هێنانی زانیاری Instagram بە requests ─────────────────────
-def fetch_instagram(url):
-    """
-    بەکارهێنانی Instagram oEmbed + GraphQL
-    بۆ وەرگرتنی لینکی ڤیدیۆ
-    """
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.instagram.com/",
+    "Origin": "https://www.instagram.com",
+    "X-IG-App-ID": "936619743392459",
+}
+
+
+def get_shortcode(url):
+    match = re.search(r"/(p|reel|tv|reels)/([A-Za-z0-9_-]+)", url)
+    return match.group(2) if match else None
+
+
+def fetch_via_embed(url):
+    """Instagram embed endpoint — بەبێ لۆگین کاردەکات"""
     try:
-        # ١. پاک کردنی لینک
-        url = url.split("?")[0].rstrip("/") + "/"
-
-        # ٢. هێنانی shortcode
-        match = re.search(r"/(p|reel|tv)/([A-Za-z0-9_-]+)", url)
-        if not match:
+        shortcode = get_shortcode(url)
+        if not shortcode:
             return None
-        shortcode = match.group(2)
 
-        # ٣. oEmbed API بۆ زانیاری سەرەکی
-        oembed = requests.get(
-            "https://www.instagram.com/api/v1/oembed/",
-            params={"url": url, "hidecaption": 0},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15
-        )
-        meta = oembed.json() if oembed.status_code == 200 else {}
-
-        # ٤. GraphQL بۆ لینکی ڤیدیۆ
-        gql_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
-        gql = requests.get(
-            gql_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X)",
-                "Accept": "application/json",
-                "Referer": "https://www.instagram.com/",
-            },
-            timeout=15
-        )
+        # Embed JSON endpoint
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        r = requests.get(embed_url, headers=HEADERS, timeout=20)
 
         video_url   = ""
-        thumbnail   = meta.get("thumbnail_url", "")
-        title       = meta.get("title", "")
-        author      = meta.get("author_name", "")
-        username    = meta.get("author_name", "")
+        thumbnail   = ""
+        title       = ""
+        author      = ""
 
-        if gql.status_code == 200:
-            try:
-                gdata = gql.json()
-                media = (
-                    gdata.get("graphql", {}).get("shortcode_media") or
-                    gdata.get("items", [{}])[0] if "items" in gdata else {}
-                )
-                if isinstance(media, dict):
-                    video_url = media.get("video_url", "")
-                    thumbnail = media.get("display_url", thumbnail)
-                    if not title:
-                        cap = media.get("edge_media_to_caption", {})
-                        edges = cap.get("edges", [])
-                        title = edges[0]["node"]["text"][:100] if edges else ""
-            except Exception:
-                pass
+        # ڕزگارکردنی video_url
+        vm = re.search(r'"video_url":"([^"]+)"', r.text)
+        if vm:
+            video_url = vm.group(1).replace("\\u0026", "&")
+
+        # thumbnail
+        tm = re.search(r'"display_url":"([^"]+)"', r.text)
+        if tm:
+            thumbnail = tm.group(1).replace("\\u0026", "&")
+
+        # author
+        am = re.search(r'"username":"([^"]+)"', r.text)
+        if am:
+            author = am.group(1)
+
+        # title/caption
+        cm = re.search(r'"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"([^"]{0,150})', r.text)
+        if cm:
+            title = cm.group(1)
+
+        if not video_url:
+            # یەکەم ڕێگا کار نەکرد، هەوڵی دووەم
+            vm2 = re.search(r'video_url":"(https:[^"]+\.mp4[^"]*)"', r.text)
+            if vm2:
+                video_url = vm2.group(1).replace("\\u0026", "&").replace("\\/", "/")
 
         return {
             "shortcode": shortcode,
-            "title":     title or f"Instagram Post {shortcode}",
+            "title":     title or f"Instagram Reel {shortcode}",
             "author":    author,
-            "username":  username,
+            "username":  author,
             "thumbnail": thumbnail,
             "video_url": video_url,
-            "webpage":   url,
+            "webpage":   f"https://www.instagram.com/p/{shortcode}/",
         }
 
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def fetch_profile(username):
     try:
         r = requests.get(
             f"https://www.instagram.com/{username}/",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15
+            headers=HEADERS,
+            timeout=20
         )
         full_name = ""
-        match = re.search(r'"full_name":"([^"]+)"', r.text)
-        if match:
-            full_name = match.group(1)
-        followers = ""
-        fmatch = re.search(r'"edge_followed_by":\{"count":(\d+)\}', r.text)
-        if fmatch:
-            followers = fmatch.group(1)
+        followers = 0
+        bio = ""
+
+        fn = re.search(r'"full_name":"([^"]*)"', r.text)
+        if fn:
+            full_name = fn.group(1)
+
+        fc = re.search(r'"edge_followed_by":\{"count":(\d+)\}', r.text)
+        if fc:
+            followers = int(fc.group(1))
+
+        bc = re.search(r'"biography":"([^"]*)"', r.text)
+        if bc:
+            bio = bc.group(1)
+
         return {
             "username":  username,
-            "full_name": full_name,
-            "followers": int(followers) if followers else 0,
+            "full_name": full_name or username,
+            "followers": followers,
+            "bio":       bio,
             "url":       f"https://www.instagram.com/{username}/",
         }
     except Exception:
         return None
 
 
-# ── Handler ───────────────────────────────────────────────────
 class handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -118,60 +123,58 @@ class handler(BaseHTTPRequestHandler):
         if path == "" or path == "/":
             self._send(200, {
                 "name":    "JackInsta API",
-                "version": "1.0",
+                "version": "2.0",
                 "author":  "JACK",
                 "channel": "@jack_721_mod",
                 "endpoints": {
-                    "/api/info":    "زانیاری پۆست یان ڕیلس  ?url=",
-                    "/api/video":   "لینکی ڤیدیۆ/ڕیلس       ?url=",
-                    "/api/audio":   "لینکی ئۆدیۆ             ?url=",
-                    "/api/profile": "زانیاری پرۆفایڵ         ?user=",
+                    "/api/info":    "زانیاری پۆست/ڕیلس   ?url=",
+                    "/api/video":   "لینکی ڤیدیۆ          ?url=",
+                    "/api/audio":   "لینکی ئۆدیۆ          ?url=",
+                    "/api/profile": "زانیاری پرۆفایڵ      ?user=",
                 }
             })
             return
 
-        # ── پشکنینی url ────────────────────────────────────
         if path in ["/api/info", "/api/video", "/api/audio"]:
             if not url:
                 self._send(400, {"error": "پێویستە ?url= زیاد بکەیت"})
                 return
             if "instagram.com" not in url:
-                self._send(400, {"error": "تەنها لینکی Instagram پشتگیری دەکرێت"})
+                self._send(400, {"error": "تەنها لینکی Instagram"})
                 return
 
         # ── /api/info ──────────────────────────────────────
         if path == "/api/info":
-            data = fetch_instagram(url)
-            if not data:
+            data = fetch_via_embed(url)
+            if not data or "error" in data:
                 self._send(404, {"error": "پۆستەکە نەدۆزرایەوە"})
                 return
             self._send(200, {"status": "success", **data})
 
         # ── /api/video ─────────────────────────────────────
         elif path == "/api/video":
-            data = fetch_instagram(url)
+            data = fetch_via_embed(url)
             if not data or not data.get("video_url"):
                 self._send(404, {"error": "لینکی ڤیدیۆ نەدۆزرایەوە"})
                 return
             self._send(200, {
                 "status":    "success",
                 "url":       data["video_url"],
-                "thumbnail": data["thumbnail"],
-                "title":     data["title"],
+                "thumbnail": data.get("thumbnail", ""),
+                "title":     data.get("title", ""),
                 "type":      "video"
             })
 
         # ── /api/audio ─────────────────────────────────────
         elif path == "/api/audio":
-            data = fetch_instagram(url)
+            data = fetch_via_embed(url)
             if not data or not data.get("video_url"):
                 self._send(404, {"error": "لینکی ئۆدیۆ نەدۆزرایەوە"})
                 return
-            # ئۆدیۆ هەمان لینکی ڤیدیۆیە، بۆتەکە جیا دەکاتەوە
             self._send(200, {
                 "status": "success",
                 "url":    data["video_url"],
-                "title":  data["title"],
+                "title":  data.get("title", ""),
                 "type":   "audio"
             })
 
